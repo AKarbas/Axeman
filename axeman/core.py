@@ -28,7 +28,7 @@ from . import certlib
 DOWNLOAD_CONCURRENCY = 50
 MAX_QUEUE_SIZE = 1000
 
-async def download_worker(session, log_info, work_deque, download_queue):
+async def download_worker(session, log_info, work_deque, download_queue, output_dir='/tmp/'):
     while True:
         try:
             start, end = work_deque.popleft()
@@ -46,7 +46,7 @@ async def download_worker(session, log_info, work_deque, download_queue):
             except Exception as e:
                 logging.error("Exception getting block {}-{}! {}".format(start, end, e))
         else:  # Notorious for else, if we didn't encounter a break our request failed 3 times D:
-            with open('/tmp/fails.csv', 'a') as f:
+            with open('{}/fails.csv'.format(output_dir), 'a') as f:
                 f.write(",".join([log_info['url'], str(start), str(end)]))
             return
 
@@ -73,7 +73,8 @@ async def queue_monitor(log_info, work_deque, download_results_queue):
         ))
         await asyncio.sleep(2)
 
-async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='/tmp/', concurrency_count=DOWNLOAD_CONCURRENCY):
+async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='/tmp/',
+                                concurrency_count=DOWNLOAD_CONCURRENCY, max_per_dir=50000):
     async with aiohttp.ClientSession(loop=loop, conn_timeout=10) as session:
         ctl_logs = await certlib.retrieve_all_ctls(session)
 
@@ -100,11 +101,12 @@ async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='
                 continue
 
             download_tasks = asyncio.gather(*[
-                download_worker(session, log_info, work_deque, download_results_queue)
+                download_worker(session, log_info, work_deque, download_results_queue, output_dir=output_directory)
                 for _ in range(concurrency_count)
             ])
 
-            processing_task    = asyncio.ensure_future(processing_coro(download_results_queue, output_dir=output_directory))
+            processing_task    = asyncio.ensure_future(processing_coro(download_results_queue,
+                                                                       output_directory, max_per_dir))
             queue_monitor_task = asyncio.ensure_future(queue_monitor(log_info, work_deque, download_results_queue))
 
             asyncio.ensure_future(download_tasks)
@@ -119,12 +121,12 @@ async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='
 
             logging.info("Completed {}, stored at {}!".format(
                 log_info['description'],
-                '/tmp/{}.csv'.format(log_info['url'].replace('/', '_'))
+                '{}/{}'.format(output_directory, log_info['url'].replace('/', '_'))
             ))
 
             logging.info("Finished downloading and processing {}".format(log_info['url']))
 
-async def processing_coro(download_results_queue, output_dir="/tmp"):
+async def processing_coro(download_results_queue, output_dir, max_per_dir):
     logging.info("Starting processing coro and process pool")
     process_pool = aioprocessing.AioPool(initargs=(output_dir,))
 
@@ -145,7 +147,11 @@ async def processing_coro(download_results_queue, output_dir="/tmp"):
 
 
         for entry in entries_iter:
-            csv_storage = '{}/certificates/{}'.format(output_dir, entry['log_info']['url'].replace('/', '_'))
+            entry_range_start = entry['start']
+            dir_range_start = entry_range_start - (entry_range_start % max_per_dir)
+            dir_range = '{}-{}'.format(dir_range_start, dir_range_start + max_per_dir - 1)
+            csv_storage = '{}/certificates/{}/{}'.format(output_dir, entry['log_info']['url'].replace('/', '_'),
+                                                         dir_range)
             if not os.path.exists(csv_storage):
                 print("[{}] Making dir...".format(os.getpid()))
                 os.makedirs(csv_storage)
@@ -268,11 +274,16 @@ def main():
 
     parser.add_argument('-z', dest="ctl_offset", action="store", default=0, help="The CTL offset to start at")
 
-    parser.add_argument('-o', dest="output_dir", action="store", default="/tmp", help="The output directory to store certificates in")
+    parser.add_argument('-o', dest="output_dir", action="store", default="/tmp",
+                        help="The output directory to store certificates in -- See -m")
+
+    parser.add_argument('-m', dest='max_per_dir', action='store', default=50000, type=int,
+                        help='Approximate max number of log rows per storage directory')
 
     parser.add_argument('-v', dest="verbose", action="store_true", help="Print out verbose/debug info")
 
-    parser.add_argument('-c', dest='concurrency_count', action='store', default=50, type=int, help="The number of concurrent downloads to run at a time")
+    parser.add_argument('-c', dest='concurrency_count', action='store', default=50, type=int,
+                        help="The number of concurrent downloads to run at a time (± log batch size)")
 
     args = parser.parse_args()
 
@@ -290,9 +301,14 @@ def main():
     logging.info("Starting...")
 
     if args.ctl_url:
-        loop.run_until_complete(retrieve_certificates(loop, url=args.ctl_url, ctl_offset=int(args.ctl_offset), concurrency_count=args.concurrency_count, output_directory=args.output_dir))
+        loop.run_until_complete(retrieve_certificates(loop, url=args.ctl_url, ctl_offset=int(args.ctl_offset),
+                                                      concurrency_count=args.concurrency_count,
+                                                      output_directory=args.output_dir,
+                                                      max_per_dir=args.max_per_dir))
     else:
-        loop.run_until_complete(retrieve_certificates(loop, concurrency_count=args.concurrency_count, output_directory=args.output_dir))
+        loop.run_until_complete(retrieve_certificates(loop, concurrency_count=args.concurrency_count,
+                                                      output_directory=args.output_dir,
+                                                      max_per_dir=args.max_per_dir))
 
 if __name__ == "__main__":
     main()
